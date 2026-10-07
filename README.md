@@ -6,7 +6,9 @@ A userscript for [Tampermonkey](https://www.tampermonkey.net/) (also works with 
 
 ## Features
 
-- Download button on each post, including posts loaded by infinite scroll
+- Download buttons on each post, including posts loaded by infinite scroll:
+  - single-page posts: **⬇ Download**
+  - multi-page posts: **⬇ Download** (just the photo/video currently shown) and **⬇ Download All (N)** (every page)
 - Downloads **every page** of multi-page posts, photos and videos, in page order
 - Files are saved in their **original format** (no re-encoding)
 - Sets the capture date to the post's timestamp:
@@ -17,7 +19,8 @@ A userscript for [Tampermonkey](https://www.tampermonkey.net/) (also works with 
   ```
   seesaw_2026-10-06_193104_931d19e1_01.jpg
   seesaw_2026-10-06_193104_931d19e1_02.mp4
-  │      │          │      │        └ page number within the post
+  │      │          │      │        └ page number within the post (same whether you
+  │      │          │      │          download one page or all; a 2nd video on a page is "_03-2")
   │      │          │      └ first 8 chars of the post id
   │      │          └ time (HHMMSS, local)
   │      └ date (local)
@@ -35,7 +38,7 @@ Tampermonkey will pick up new versions automatically.
 
 ## Usage
 
-Click **⬇ Download** under any post. The button shows progress and how many files were saved. The first time, your browser may ask to allow multiple downloads from the site — choose *Allow*.
+Click **⬇ Download** to save the photo or video you're looking at (on a multi-page post, flip to the page you want first). On multi-page posts, **⬇ Download All (N)** saves every page. The button shows progress and how many files were saved. The first time, your browser may ask to allow multiple downloads from the site — choose *Allow*.
 
 To save everything into one folder, set your browser's download location to that folder.
 
@@ -45,7 +48,6 @@ Edit the `CONFIG` block at the top of the script:
 
 | Option | Default | Description |
 |---|---|---|
-| `downloadMode` | `'files'` | `'files'` = one download per photo/video; `'zip'` = one `.zip` per post (entries also get the post date as their modified time) |
 | `filePrefix` | `'seesaw'` | Prefix for file names |
 | `pageWaitMs` | `8000` | Max wait per page when falling back to clicking through a post |
 | `debug` | `false` | Verbose console logging |

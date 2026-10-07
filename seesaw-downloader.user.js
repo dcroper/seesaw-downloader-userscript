@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Seesaw Post Downloader
 // @namespace    https://app.seesaw.me/
-// @version      1.1.1
+// @version      1.2.0
 // @description  Adds a Download button to each Seesaw feed post. Saves every photo/video in its original format with the "date taken" set to the post date (EXIF for JPEGs, MP4/MOV header for videos).
 // @match        https://app.seesaw.me/*
 // @author       David Roper
@@ -11,7 +11,6 @@
 // @downloadURL  https://raw.githubusercontent.com/dcroper/seesaw-downloader-userscript/main/seesaw-downloader.user.js
 // @updateURL    https://raw.githubusercontent.com/dcroper/seesaw-downloader-userscript/main/seesaw-downloader.user.js
 // @require      https://cdn.jsdelivr.net/npm/piexifjs@1.0.6/piexif.js
-// @require      https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js
 // @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
 // @connect      seesaw.me
@@ -21,15 +20,12 @@
 // @run-at       document-start
 // ==/UserScript==
 
-/* global piexif, JSZip, GM_info, GM_xmlhttpRequest, unsafeWindow */
+/* global piexif */
 (function () {
   'use strict';
 
   // ------------------------------------------------------------------ config
   const CONFIG = {
-    // 'files' = one download per photo/video, 'zip' = one .zip per post
-    // (zip entries also carry the post date as their file modified time).
-    downloadMode: 'files',
     filePrefix: 'seesaw',
     pageWaitMs: 8000, // max wait for a carousel page / video to load
     debug: false,
@@ -53,6 +49,7 @@
   // ------------------------------------------------------------ UI
   let lastCount = -1;
   function addButtons() {
+    resetStaleButtons();
     const posts = document.querySelectorAll(SEL.post);
     if (posts.length !== lastCount) {
       lastCount = posts.length;
@@ -66,20 +63,29 @@
         article.querySelector('.sp-item-footer-container') ||
         article;
       if (article.querySelector('.ssdl-btn')) return;
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = 'btn ss-feed-item-footer__btn ssdl-btn';
-      btn.setAttribute('aria-label', 'Download photos and videos from this post');
-      btn.textContent = '⬇ Download';
-      btn.style.marginLeft = '4px';
-      btn.addEventListener('click', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        if (btn.disabled) return;
-        downloadPost(article, btn);
-      });
+      const pages = getPageCount(article);
+      const makeBtn = (label, aria, mode) => {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'btn ss-feed-item-footer__btn ssdl-btn';
+        btn.setAttribute('aria-label', aria);
+        btn.textContent = label;
+        btn.dataset.label = label;
+        btn.style.marginLeft = '4px';
+        btn.addEventListener('click', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          if (btn.disabled) return;
+          downloadPost(article, btn, mode);
+        });
+        return btn;
+      };
+      const btns = pages > 1
+        ? [makeBtn('⬇ Download', 'Download the photo or video on the page currently shown', 'current'),
+          makeBtn(`⬇ Download All (${pages})`, `Download all ${pages} pages of this post`, 'all')]
+        : [makeBtn('⬇ Download', 'Download the photo or video in this post', 'all')];
       const clearDiv = footer.querySelector(':scope > div[style*="clear"]');
-      footer.insertBefore(btn, clearDiv || null);
+      btns.forEach((b) => footer.insertBefore(b, clearDiv || null));
     });
   }
 
@@ -90,7 +96,20 @@
       if (pending) return;
       pending = true;
       setTimeout(() => { pending = false; addButtons(); }, 300);
-    }).observe(document.documentElement, { childList: true, subtree: true });
+    }).observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+      // Flipping pages updates the "1 / 18" text and the page element's
+      // data-testid / image src in place, so childList alone misses it.
+      characterData: true,
+      attributes: true,
+      attributeFilter: ['data-testid', 'src'],
+    });
+    // Also react immediately to clicks/keys/swipes that may change the page.
+    const soon = () => { setTimeout(resetStaleButtons, 50); setTimeout(resetStaleButtons, 400); };
+    document.addEventListener('click', soon, true);
+    document.addEventListener('keyup', soon, true);
+    document.addEventListener('touchend', soon, true);
     setInterval(addButtons, 2000); // safety net if mutations are missed
     addButtons();
   }
@@ -151,11 +170,16 @@
   }
 
   // ------------------------------------------------------------ main flow
-  async function downloadPost(article, btn) {
+  /** mode: 'all' = every page of the post, 'current' = only the page on screen. */
+  async function downloadPost(article, btn, mode = 'all') {
     const setStatus = (t) => { btn.textContent = t; };
     btn.disabled = true;
     try {
       setStatus('Finding media…');
+      // Capture which page is on screen before any await, in case it changes.
+      const shownPage = currentPage(article);
+      const shownPageId = shownPage ? (shownPage.dataset.testid || '').replace(/^:item-/, '') : '';
+      const shownPageNo = pageIndex(article);
       const feedItem = getAngularItem(article);
       // The feed only carries page 1 of each post; /api/item_v2 returns every
       // page (photos and videos, in order). Fall back to feed data / carousel.
@@ -175,18 +199,32 @@
       // photo/video posts come out in page order.
       const expected = (item && item.num_pages) || getPageCount(article);
       const dataPages = (item && item.pages && item.pages.objects) || [];
-      const fromData = item ? extractMediaFromItem(item) : [];
-      const dataComplete = item && dataPages.length >= expected &&
-        (!item.has_canvas_videos || fromData.some((m) => m.kind === 'video'));
       let media;
-      if (dataComplete) {
-        media = fromData;
-        log('using item data', media);
+      if (mode === 'current') {
+        let idx = dataPages.findIndex((p) => p.item_page_id === shownPageId);
+        if (idx < 0 && dataPages.length >= expected) idx = shownPageNo - 1;
+        if (idx >= 0 && dataPages[idx]) {
+          media = pageMedia(dataPages[idx], idx + 1);
+        } else if (shownPage) {
+          media = await mediaFromDomPage(article, shownPage, shownPageNo);
+        } else {
+          media = [];
+        }
+        log('current page', shownPageNo, media);
       } else {
-        log('walking carousel; data pages', dataPages.length, 'of', expected);
-        media = mergeMedia([], await collectByPaging(article, setStatus, expected));
+        const fromData = item ? extractMediaFromItem(item) : [];
+        const dataComplete = item && dataPages.length >= expected &&
+          (!item.has_canvas_videos || fromData.some((m) => m.kind === 'video'));
+        if (dataComplete) {
+          media = fromData;
+          log('using item data', media);
+        } else {
+          log('walking carousel; data pages', dataPages.length, 'of', expected);
+          media = mergeMedia([], await collectByPaging(article, setStatus, expected));
+        }
       }
-      if (!media.length) throw new Error('No photos or videos found in this post');
+      if (!media.length) throw new Error('No photos or videos found');
+      numberMedia(media);
 
       const base = baseName(date, item);
       const files = [];
@@ -194,7 +232,7 @@
       for (let i = 0; i < media.length; i++) {
         setStatus(`Downloading ${i + 1}/${media.length}…`);
         try {
-          files.push(await fetchAndStamp(media[i], date, i + 1, base));
+          files.push(await fetchAndStamp(media[i], date, base));
         } catch (err) {
           console.error('[SSDL] failed', media[i], err);
           errors.push(`#${i + 1}: ${err.message}`);
@@ -203,7 +241,7 @@
 
       if (files.length) {
         setStatus('Saving…');
-        await saveFiles(files, date, base);
+        await saveFiles(files);
       }
       if (errors.length) {
         setStatus(`⚠ ${files.length}/${media.length} saved`);
@@ -217,8 +255,33 @@
       alert('Seesaw downloader: ' + err.message);
     } finally {
       btn.disabled = false;
-      setTimeout(() => { btn.textContent = '⬇ Download'; }, 6000);
+      // Show the result until the user flips to another page (checked in
+      // addButtons on every DOM change) or for 6 s, whichever comes first.
+      btn.dataset.donePage = pageKey(article);
+      clearTimeout(btn._ssdlTimer);
+      btn._ssdlTimer = setTimeout(() => resetButton(btn), 6000);
     }
+  }
+
+  /** Identifies the page currently shown in a post's carousel. */
+  function pageKey(article) {
+    const p = currentPage(article);
+    return `${p ? p.dataset.testid : ''}|${pageIndex(article)}`;
+  }
+
+  function resetButton(btn) {
+    if (btn.disabled) return; // a new download is running
+    clearTimeout(btn._ssdlTimer);
+    delete btn.dataset.donePage;
+    btn.textContent = btn.dataset.label || '⬇ Download';
+  }
+
+  /** Resets "✓ 1 saved" labels as soon as the user navigates to another page. */
+  function resetStaleButtons() {
+    document.querySelectorAll('.ssdl-btn[data-done-page]').forEach((btn) => {
+      const article = btn.closest(SEL.post);
+      if (!article || pageKey(article) !== btn.dataset.donePage) resetButton(btn);
+    });
   }
 
   // ------------------------------------------------------------ data sources
@@ -249,30 +312,46 @@
    * composite_image_map.compositeImageMap[].actions[{action:'video', payload:{videoSrc}}].
    * A page with a video yields only the video (its composite image is the poster frame).
    */
-  function pageMedia(p) {
+  function pageMedia(p, pageNo) {
     const vids = [];
     const regions = p.composite_image_map && p.composite_image_map.compositeImageMap;
     (Array.isArray(regions) ? regions : []).forEach((r) => (r.actions || []).forEach((a) => {
-      if (a && a.action === 'video' && a.payload && a.payload.videoSrc) vids.push({ url: a.payload.videoSrc, kind: 'video' });
+      if (a && a.action === 'video' && a.payload && a.payload.videoSrc) vids.push({ url: a.payload.videoSrc, kind: 'video', page: pageNo });
     }));
     if (vids.length) return vids;
     const img = p.composite_image_url || p.composite_image_resizable_url;
-    return img ? [{ url: img, kind: 'image' }] : [];
+    return img ? [{ url: img, kind: 'image', page: pageNo }] : [];
   }
 
   /** Map of item_page_id -> media, for whatever pages the item data currently holds. */
   function dataPagesById(item) {
     const m = new Map();
     const pages = (item && item.pages && item.pages.objects) || [];
-    pages.forEach((p) => p.item_page_id && m.set(p.item_page_id, pageMedia(p)));
+    pages.forEach((p, i) => p.item_page_id && m.set(p.item_page_id, pageMedia(p, i + 1)));
     return m;
   }
 
+  /**
+   * Gives every media entry a page number (if it lacks one) and a sub-index for
+   * pages holding more than one file, so names stay stable whether you download
+   * one page or the whole post: page 3 is always "_03", a 2nd video on it "_03-2".
+   */
+  function numberMedia(media) {
+    const perPage = new Map();
+    media.forEach((m, i) => {
+      if (!m.page) m.page = i + 1;
+      const n = perPage.get(m.page) || 0;
+      m.sub = n;
+      perPage.set(m.page, n + 1);
+    });
+    return media;
+  }
+
   function extractMediaFromItem(item) {
-    // Known shape (from /api/person/parent/feed): item.pages.objects[].composite_image_url
+    // Known shape (from /api/item_v2 and the feed): item.pages.objects[]
     const pages = item.pages && item.pages.objects;
     if (Array.isArray(pages) && pages.length) {
-      const fromPages = pages.flatMap(pageMedia);
+      const fromPages = pages.flatMap((p, i) => pageMedia(p, i + 1));
       if (fromPages.length) return mergeMedia([], fromPages);
     }
     // Unknown shape: walk the object for media URLs.
@@ -333,7 +412,9 @@
     const pages = [...article.querySelectorAll(SEL.page)];
     if (pages.length <= 1) return pages[0] || null;
     // Several rendered (prefetch): pick the one most inside the post's viewport.
-    const box = article.querySelector('[data-testid=":open-item-modal"]').getBoundingClientRect();
+    const boxEl = article.querySelector('[data-testid=":open-item-modal"]');
+    if (!boxEl) return pages[0];
+    const box = boxEl.getBoundingClientRect();
     const overlap = (el) => {
       const r = el.getBoundingClientRect();
       return Math.max(0, Math.min(r.right, box.right) - Math.max(r.left, box.left));
@@ -386,21 +467,7 @@
         return p && (p.querySelector('img[src^="http"]') || p.parentElement.querySelector(SEL.watchVideo)) ? p : null;
       });
       if (page) {
-        // Prefer the item data for this page (the app may load more pages into
-        // it as we flip through); fall back to what the DOM shows.
-        const pageId = (page.dataset.testid || '').replace(/^:item-/, '');
-        const known = dataPagesById(getAngularItem(article)).get(pageId);
-        const video = page.parentElement.querySelector(SEL.watchVideo);
-        if (known && known.length) {
-          out.push(...known);
-        } else if (video) {
-          const src = await grabVideoSrc(article, video);
-          if (src) out.push({ url: src, kind: 'video' });
-          else console.warn('[SSDL] could not get video URL on page', i);
-        } else {
-          const img = page.querySelector('img[src^="http"]');
-          if (img) out.push({ url: img.src, kind: 'image', fallback: img.src });
-        }
+        out.push(...await mediaFromDomPage(article, page, i));
       }
       if (i < total) {
         const next = article.querySelector(SEL.next);
@@ -416,6 +483,26 @@
       }
     }
     return out;
+  }
+
+  /**
+   * Media for one rendered carousel page. Prefers the item data for that page
+   * (the app may load more pages into it as you flip through); falls back to
+   * what the DOM shows.
+   */
+  async function mediaFromDomPage(article, page, pageNo) {
+    const pageId = (page.dataset.testid || '').replace(/^:item-/, '');
+    const known = dataPagesById(getAngularItem(article)).get(pageId);
+    if (known && known.length) return known.map((m) => ({ ...m, page: pageNo }));
+    const video = page.parentElement.querySelector(SEL.watchVideo);
+    if (video) {
+      const src = await grabVideoSrc(article, video);
+      if (src) return [{ url: src, kind: 'video', page: pageNo }];
+      console.warn('[SSDL] could not get video URL on page', pageNo);
+      return [];
+    }
+    const img = page.querySelector('img[src^="http"]');
+    return img ? [{ url: img.src, kind: 'image', fallback: img.src, page: pageNo }] : [];
   }
 
   async function grabVideoSrc(article, trigger) {
@@ -524,7 +611,7 @@
     return null;
   }
 
-  async function fetchAndStamp(m, date, index, base) {
+  async function fetchAndStamp(m, date, base) {
     let buf = null, type = null, lastErr = null;
     for (const url of candidates(m)) {
       try {
@@ -552,7 +639,8 @@
       console.warn(`[SSDL] ${type}: cannot embed date, saved as-is`);
       blob = new Blob([buf]);
     }
-    return { blob, name: `${base}_${pad(index)}.${type}` };
+    const suffix = pad(m.page || 1) + (m.sub ? `-${m.sub + 1}` : '');
+    return { blob, name: `${base}_${suffix}.${type}` };
   }
 
   // ------------------------------------------------------------ EXIF (JPEG)
@@ -644,14 +732,7 @@
     setTimeout(() => URL.revokeObjectURL(url), 60000);
   }
 
-  async function saveFiles(files, date, base) {
-    if (CONFIG.downloadMode === 'zip') {
-      const zip = new JSZip();
-      files.forEach((f) => zip.file(f.name, f.blob, { date, binary: true }));
-      const blob = await zip.generateAsync({ type: 'blob', compression: 'STORE' });
-      triggerDownload(blob, `${base}.zip`);
-      return;
-    }
+  async function saveFiles(files) {
     for (const f of files) {
       triggerDownload(f.blob, f.name);
       await sleep(400); // browsers throttle bursts of downloads
